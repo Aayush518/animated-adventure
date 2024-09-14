@@ -1,0 +1,186 @@
+// Define the region of interest (ROI)
+var roi = ee.Geometry.Rectangle([83.5, 27.5, 84.5, 28.5]); // Approximate coordinates for SetiGandaki Region
+
+// Load required datasets
+var dem = ee.Image('USGS/SRTMGL1_003').clip(roi);
+var landcover = ee.ImageCollection('ESA/WorldCover/v100').first().clip(roi);
+var precipitation = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate('2020-01-01', '2020-12-31')
+  .sum()
+  .clip(roi);
+
+// Calculate slope from DEM
+var slope = ee.Terrain.slope(dem);
+
+// Reclassify datasets for flood susceptibility
+function reclassify(image, breaks, newValues, bandName) {
+  var recoded = ee.Image(0);
+  for (var i = 0; i < breaks.length; i++) {
+    recoded = recoded.where(image.lte(breaks[i]), newValues[i]);
+  }
+  return recoded.rename(bandName);
+}
+
+var demReclass = reclassify(dem, [500, 1000, 1500, 2000], [5, 4, 3, 2, 1], 'dem_reclass');
+var slopeReclass = reclassify(slope, [5, 15, 25, 35], [5, 4, 3, 2, 1], 'slope_reclass');
+var precipReclass = reclassify(precipitation, [500, 1000, 1500, 2000], [1, 2, 3, 4, 5], 'precip_reclass');
+
+var lcReclass = landcover.remap(
+  [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100],
+  [3, 2, 1, 4, 5, 4, 3, 2, 1, 5, 4]
+).rename('lc_reclass');
+
+// Calculate flood susceptibility index
+var weights = {dem: 0.3, slope: 0.3, lc: 0.2, precip: 0.2};
+var floodSusceptibility = demReclass.multiply(weights.dem)
+  .add(slopeReclass.multiply(weights.slope))
+  .add(lcReclass.multiply(weights.lc))
+  .add(precipReclass.multiply(weights.precip))
+  .rename('flood_susceptibility');
+
+// Classify flood susceptibility into risk zones
+var riskZones = reclassify(floodSusceptibility, [2, 3, 4], [1, 2, 3, 4], 'risk_zones');
+
+// Visualization parameters
+var elevationVis = {min: 0, max: 3000, palette: ['006633', 'E5FFCC', '662A00', 'D8D8D8', 'F5F5F5']};
+var slopeVis = {min: 0, max: 60, palette: ['006633', 'E5FFCC', '662A00', 'D8D8D8', 'F5F5F5']};
+var precipVis = {min: 0, max: 2000, palette: ['FF0000', 'FFFF00', '00FF00', '00FFFF', '0000FF']};
+var riskVis = {min: 1, max: 4, palette: ['green', 'yellow', 'orange', 'red']};
+
+// Add layers to the map
+Map.centerObject(roi, 8);
+Map.addLayer(dem, elevationVis, 'Elevation');
+Map.addLayer(slope, slopeVis, 'Slope');
+Map.addLayer(precipitation, precipVis, 'Precipitation');
+Map.addLayer(landcover, {}, 'Land Cover');
+Map.addLayer(riskZones, riskVis, 'Flood Risk Zones');
+
+// Create a function to generate histograms
+function createHistogram(image, title, xAxis, yAxis, maxBuckets) {
+  var histogram = ui.Chart.image.histogram({
+    image: image,
+    region: roi,
+    scale: 100,
+    maxPixels: 1e9,
+    maxBuckets: maxBuckets
+  });
+  histogram.setOptions({
+    title: title,
+    hAxis: {title: xAxis},
+    vAxis: {title: yAxis},
+    legend: {position: 'none'}
+  });
+  return histogram;
+}
+
+// Generate histograms
+print(createHistogram(dem, 'Elevation Distribution', 'Elevation (m)', 'Frequency', 30));
+print(createHistogram(slope, 'Slope Distribution', 'Slope (degrees)', 'Frequency', 30));
+print(createHistogram(precipitation, 'Precipitation Distribution', 'Precipitation (mm)', 'Frequency', 30));
+
+// Function to calculate areas
+function calculateAreas(image, classes, scale) {
+  var areas = ee.Image.pixelArea().addBands(image);
+  var areaDict = areas.reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class',
+    }),
+    geometry: roi,
+    scale: scale,
+    maxPixels: 1e9
+  });
+  
+  var classAreas = ee.List(areaDict.get('groups'));
+  
+  var classAreaLists = classes.map(function(cls) {
+    var areaObj = classAreas.filter(function(obj) {
+      return ee.Number(ee.Dictionary(obj).get('class')).eq(cls);
+    }).get(0);
+    var area = ee.Dictionary(areaObj).get('sum');
+    return [cls, ee.Number(area).divide(1e6)];  // Convert to sq km
+  });
+  
+  return ee.Dictionary(classAreaLists.flatten());
+}
+
+// Calculate areas
+var lcClasses = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100];
+var riskClasses = [1, 2, 3, 4];
+
+var lcAreas = calculateAreas(landcover, lcClasses, 100);
+var riskAreas = calculateAreas(riskZones, riskClasses, 100);
+
+// Create bar charts for land cover and risk zones
+var lcChart = ui.Chart.array.values({
+  array: ee.Array(lcAreas.values()),
+  axis: 0,
+  xLabels: lcAreas.keys()
+}).setChartType('ColumnChart')
+  .setOptions({
+    title: 'Land Cover Distribution',
+    hAxis: {title: 'Land Cover Class', gridlines: {count: 12}},
+    vAxis: {title: 'Area (sq km)'}
+  });
+
+var riskChart = ui.Chart.array.values({
+  array: ee.Array(riskAreas.values()),
+  axis: 0,
+  xLabels: riskAreas.keys()
+}).setChartType('ColumnChart')
+  .setOptions({
+    title: 'Flood Risk Zone Distribution',
+    hAxis: {title: 'Risk Zone', gridlines: {count: 4}},
+    vAxis: {title: 'Area (sq km)'}
+  });
+
+print(lcChart);
+print(riskChart);
+
+// Calculate zonal statistics
+var zonalStats = floodSusceptibility.addBands(riskZones).reduceRegion({
+  reducer: ee.Reducer.mean().group({
+    groupField: 1,
+    groupName: 'risk_zone',
+  }),
+  geometry: roi,
+  scale: 100,
+  maxPixels: 1e9
+});
+
+var statsFormatted = ee.List(zonalStats.get('groups')).map(function(item) {
+  var dict = ee.Dictionary(item);
+  var riskZone = dict.get('risk_zone');
+  var meanSusceptibility = dict.get('mean');
+  return [riskZone, meanSusceptibility];
+});
+
+var statsChart = ui.Chart.array.values({
+  array: ee.Array(statsFormatted),
+  axis: 1,
+  xLabels: ['Risk Zone', 'Mean Susceptibility']
+}).setChartType('Table')
+  .setOptions({title: 'Zonal Statistics: Mean Susceptibility by Risk Zone'});
+
+print(statsChart);
+
+// Export results
+Export.image.toDrive({
+  image: riskZones,
+  description: 'flood_risk_zones',
+  scale: 30,
+  region: roi,
+  maxPixels: 1e9
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection([
+    ee.Feature(null, {
+      'land_cover_areas': lcAreas,
+      'risk_zone_areas': riskAreas,
+      'zonal_stats': statsFormatted
+    })
+  ]),
+  description: 'flood_risk_analysis_results',
+  fileFormat: 'CSV'
+});
